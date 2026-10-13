@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClassToken DApp (viem + TrustKeys)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  section { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  input { padding: .4rem; width: 100%; box-sizing: border-box; margin: .25rem 0; }
+  button { padding: .45rem .9rem; cursor: pointer; }
+  #status { margin-top: .5rem; font-weight: 600; word-break: break-all; }
+  li { font-family: monospace; font-size: 12px; word-break: break-all; margin-bottom: .3rem; }
+</style>
+</head>
+<body>
+<h1>ClassToken DApp</h1>
+
+<section>
+  <h3>1. Kết nối ví / Connect</h3>
+  <button id="connect">Connect</button> <span id="acct">Chưa kết nối</span>
+</section>
+
+<section>
+  <h3>2. Tải token / Load token</h3>
+  <input id="token" placeholder="Địa chỉ ClassToken 0x...">
+  <button id="load">Load token</button>
+  <div id="info"></div>
+</section>
+
+<section>
+  <h3>3. Chuyển token / Send</h3>
+  <input id="to" placeholder="Địa chỉ người nhận 0x...">
+  <input id="amt" value="100" placeholder="Số lượng CTK">
+  <button id="send">Send</button>
+  <div id="status"></div>
+</section>
+
+<section>
+  <h3>4. Sự kiện Transfer (5000 block gần nhất)</h3>
+  <button id="refresh">Refresh</button>
+  <ul id="events"></ul>
+</section>
+
+<script type="module">
+import {
+  createPublicClient, createWalletClient, custom, http,
+  parseAbi, parseUnits, formatUnits, defineChain, getAddress,
+} from "https://esm.sh/viem@2.21.54";
+
+const trustkeys = defineChain({
+  id: 11968,
+  name: "TrustKeys L1 Testnet",
+  nativeCurrency: { name: "TrustKeys Coin", symbol: "TKC", decimals: 18 },
+  rpcUrls: { default: { http: ["https://l1testnet.trustkeys.network"] } },
+  testnet: true,
+});
+const abi = parseAbi([
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+  "function balanceOf(address) view returns (uint256)",
+  "function transfer(address to, uint256 value) returns (bool)",
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
+]);
+
+const publicClient = createPublicClient({ chain: trustkeys, transport: http() }); // ĐỌC
+let walletClient, provider, account, tokenAddr, decimals, symbol;               // GHI
+const $ = (id) => document.getElementById(id);
+const setStatus = (t) => ($("status").textContent = t);
+const errMsg = (e) =>
+  e.name === "UserRejectedRequestError" || e.cause?.name === "UserRejectedRequestError"
+    ? "Đã từ chối ký trong ví"
+    : "Lỗi: " + (e.shortMessage ?? e.message);
+
+// EIP-6963: tìm ví; dự phòng window.ethereum (EIP-1193)
+const wallets = [];
+window.addEventListener("eip6963:announceProvider", (e) => wallets.push(e.detail));
+window.dispatchEvent(new Event("eip6963:requestProvider"));
+
+async function switchNetwork() {
+  const chainId = "0x" + trustkeys.id.toString(16);
+  try {
+    await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId }] });
+  } catch (e) {
+    if (e.code !== 4902 && e.code !== -32603) throw e;
+    await provider.request({
+      method: "wallet_addEthereumChain",
+      params: [{
+        chainId, chainName: trustkeys.name,
+        nativeCurrency: trustkeys.nativeCurrency,
+        rpcUrls: trustkeys.rpcUrls.default.http,
+      }],
+    });
+  }
+}
+
+$("connect").onclick = async () => {
+  try {
+    provider = wallets.find((w) => w.info.rdns === "io.metamask")?.provider
+      ?? wallets[0]?.provider ?? window.ethereum;
+    if (!provider) throw new Error("Không tìm thấy ví. Hãy cài MetaMask.");
+    await switchNetwork();
+    walletClient = createWalletClient({ chain: trustkeys, transport: custom(provider) });
+    [account] = await walletClient.requestAddresses();
+    $("acct").textContent = account;
+    if (tokenAddr) await refresh();
+  } catch (e) { $("acct").textContent = errMsg(e); }
+};
+
+const read = (functionName, args) =>
+  publicClient.readContract({ address: tokenAddr, abi, functionName, args });
+
+async function refresh() {
+  let html = `${symbol} — ${tokenAddr}`;
+  if (account) {
+    const bal = await read("balanceOf", [account]);
+    html += `<br>Số dư: <b>${formatUnits(bal, decimals)} ${symbol}</b>`;
+  }
+  $("info").innerHTML = html;
+  await loadEvents();
+}
+
+$("load").onclick = async () => {
+  try {
+    tokenAddr = getAddress($("token").value.trim());
+    [symbol, decimals] = await Promise.all([read("symbol"), read("decimals")]);
+    await refresh();
+  } catch (e) { $("info").textContent = errMsg(e); }
+};
+
+$("send").onclick = async () => {
+  try {
+    if (!account) throw new Error("Hãy Connect ví trước.");
+    if (!tokenAddr) throw new Error("Hãy Load token trước.");
+    const to = getAddress($("to").value.trim());
+    const value = parseUnits($("amt").value.trim(), decimals);
+    setStatus("Simulating…");
+    const { request } = await publicClient.simulateContract({
+      address: tokenAddr, abi, functionName: "transfer", args: [to, value], account,
+    });
+    const hash = await walletClient.writeContract(request);
+    setStatus(`PENDING (${hash})`);
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    setStatus(receipt.status === "success"
+      ? `SUCCESS (block ${receipt.blockNumber})` : "REVERTED");
+    await refresh(); // chỉ cập nhật số dư SAU khi có receipt
+  } catch (e) { setStatus(errMsg(e)); }
+};
+
+async function loadEvents() {
+  const latest = await publicClient.getBlockNumber();
+  const fromBlock = latest > 5000n ? latest - 5000n : 0n;
+  const logs = await publicClient.getContractEvents({
+    address: tokenAddr, abi, eventName: "Transfer", fromBlock, toBlock: latest,
+  });
+  const ul = $("events");
+  ul.replaceChildren();
+  for (const l of logs.reverse().slice(0, 20)) {
+    const li = document.createElement("li");
+    li.textContent = `#${l.blockNumber} ${l.args.from} → ${l.args.to}: ${formatUnits(l.args.value, decimals)} ${symbol}`;
+    ul.appendChild(li);
+  }
+  if (!logs.length) ul.textContent = "Chưa có sự kiện Transfer trong 5000 block gần nhất.";
+}
+$("refresh").onclick = () => tokenAddr && loadEvents().catch((e) => ($("events").textContent = errMsg(e)));
+</script>
+</body>
+</html>
